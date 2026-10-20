@@ -1,5 +1,7 @@
-"""金包銀模型：用日線資料判斷是否為起漲進場點，並檢查出場警示。
+"""新式形態學三週期評分模型。
 
+60分K（找起漲點）4 項、日K（確認趨勢）4 項、週K（判斷位階）2 項，
+共 10 項、每項 10 分，滿分 100。第四類「風控硬性條件」不計分，只發警示。
 所有門檻集中在 PARAMS，方便日後調整。
 """
 from dataclasses import dataclass, field
@@ -7,162 +9,210 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 PARAMS = {
-    "drop_lookback": 250,      # 回看約一年找「先跌」
-    "min_drop": 0.15,          # 從高點回落至少 15%
-    "base_window": 20,         # 盤整區間觀察天數
-    "max_range": 0.15,         # 盤整區間高低差上限 15%
-    "slope_days": 10,          # 60MA 斜率比較天數
-    "flat_tolerance": -0.005,  # 60MA 10 天內跌幅不超過 0.5% 視為走平
-    "breakout_days": 5,        # 幾天內突破長均線算「剛突破」
-    "vol_mult": 1.5,           # 突破時成交量 >= 20 日均量 × 1.5
-    "max_bias": 0.10,          # 收盤距 60MA 乖離上限（超過算追高）
-    "big_vol_mult": 2.0,       # 爆量定義：成交量 >= 20 日均量 × 2
-    "high_zone": 0.05,         # 距近 60 日高點 5% 內算高檔
+    "h_slope_bars": 20,         # 60分K：60MA 與幾根前比較（約 4 個交易日）
+    "h_flat_tolerance": -0.003, # 60分K：60MA 跌幅不超過 0.3% 視為走平
+    "d_rise_days": 3,           # 日K：均線與幾天前比較，判斷是否向上
+    "w_safe_bias": 0.10,        # 週K：距週20MA 乖離 10% 內算安全區
+    "w_danger_bias": 0.20,      # 週K：距週20MA 乖離超過 20% 算危險區
+    "below5_days": 3,           # 日K：跌破 5MA 連續幾天站不回算硬性出場
+    "big_vol_mult": 2.0,        # 爆量：成交量 >= 20 日均量 × 2
+    "high_zone": 0.05,          # 距近 60 日高點 5% 內算高檔
 }
+
+MA_LIST = (5, 10, 20, 60, 120, 240)
 
 
 @dataclass
 class Check:
     name: str
-    passed: bool
+    passed: bool | None   # None = 資料不足
     detail: str
 
 
 @dataclass
+class Group:
+    name: str
+    task: str
+    checks: list
+
+    @property
+    def score(self) -> int:
+        return sum(10 for c in self.checks if c.passed)
+
+    @property
+    def full(self) -> int:
+        return 10 * len(self.checks)
+
+
+@dataclass
 class Result:
-    signal: str          # setup / breakout / extended / none / insufficient
+    level: str          # strong / watch / weak / insufficient
     title: str
     summary: str
-    checks: list = field(default_factory=list)
-    warnings: list = field(default_factory=list)
-    df: pd.DataFrame | None = None
+    score: int = 0
+    groups: list = field(default_factory=list)
+    risks: list = field(default_factory=list)
+    daily: pd.DataFrame | None = None
+    hourly: pd.DataFrame | None = None
+    weekly: pd.DataFrame | None = None
 
 
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def add_ma(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    for n in (5, 10, 20, 60, 120, 240):
+    for n in MA_LIST:
         df[f"MA{n}"] = df["Close"].rolling(n).mean()
     df["VMA20"] = df["Volume"].rolling(20).mean()
     return df
 
 
+def to_weekly(daily: pd.DataFrame) -> pd.DataFrame:
+    w = daily.resample("W-FRI").agg({"Open": "first", "High": "max", "Low": "min",
+                                     "Close": "last", "Volume": "sum"}).dropna()
+    return add_ma(w)
+
+
 def _pct(x: float) -> str:
-    return f"{x * 100:.1f}%"
+    return f"{x * 100:+.1f}%"
 
 
-def evaluate(raw: pd.DataFrame, p: dict = PARAMS) -> Result:
-    if raw is None or len(raw) < 130:
-        return Result("insufficient", "資料不足",
-                      "上市時間太短或查無資料，至少需要約半年的日線資料。")
+def _ok(x) -> bool:
+    return x is not None and pd.notna(x)
 
-    df = add_indicators(raw)
-    t = df.iloc[-1]
+
+# ---------- 60分K：找起漲點（金包銀） ----------
+def hourly_checks(h: pd.DataFrame | None, p: dict) -> tuple[list, str]:
+    names = ["K棒站上 60MA（生命線）", "60MA 走平或上彎", "長均線在 60MA 上方（金包銀結構）",
+             "K棒突破長均線（發動）"]
+    if h is None or len(h) < 80:
+        return [Check(n, None, "60分K 資料不足") for n in names], "資料不足"
+    t = h.iloc[-1]
     close, ma60 = t["Close"], t["MA60"]
-    ma120 = t["MA120"]
-    ma240 = t["MA240"] if pd.notna(t["MA240"]) else None
-    longs = [m for m in (ma120, ma240) if m is not None and pd.notna(m)]
+    longs = [m for m in (t["MA120"], t["MA240"]) if _ok(m)]
 
-    # 1. 先跌後止跌
-    look = df.iloc[-p["drop_lookback"]:]
-    peak_idx = look["High"].idxmax()
-    after_peak = look.loc[peak_idx:]
-    drop = 1 - after_peak["Low"].min() / look.loc[peak_idx, "High"]
-    recent_low = df["Low"].iloc[-p["base_window"]:].min()
-    prior_low = df["Low"].iloc[-60:-p["base_window"]].min()
-    stop_falling = recent_low >= prior_low * 0.99
-    c1 = Check("先跌後止跌", drop >= p["min_drop"] and stop_falling,
-               f"近{p['drop_lookback']}日從高點最大回落 {_pct(drop)}；"
-               f"近{p['base_window']}日{'沒有' if stop_falling else '仍有'}再破前低")
+    c1 = Check(names[0], close > ma60, f"收盤 {close:.2f}，60MA {ma60:.2f}")
 
-    # 2. 站上 60MA
-    c2 = Check("站上生命線（60MA）", close > ma60,
-               f"收盤 {close:.2f}，60MA {ma60:.2f}")
+    prev = h["MA60"].iloc[-1 - p["h_slope_bars"]]
+    slope = ma60 / prev - 1 if _ok(prev) else 0
+    c2 = Check(names[1], slope >= p["h_flat_tolerance"],
+               f"60MA 與 {p['h_slope_bars']} 根前相比 {_pct(slope)}")
 
-    # 3. 60MA 走平或上彎
-    ma60_prev = df["MA60"].iloc[-1 - p["slope_days"]]
-    slope = ma60 / ma60_prev - 1
-    c3 = Check("60MA 走平或上彎", slope >= p["flat_tolerance"],
-               f"60MA 與 {p['slope_days']} 天前相比 {'+' if slope >= 0 else ''}{_pct(slope)}"
-               + ("（上彎）" if slope > 0.002 else "（走平）" if slope >= p["flat_tolerance"] else "（下彎）"))
-
-    # 4. 長均線壓在 60MA 上方
     over = [m for m in longs if m > ma60]
-    long_txt = f"120MA {ma120:.2f}" + (f"、240MA {ma240:.2f}" if ma240 else "（240MA 資料不足）")
-    c4 = Check("長均線在上方壓著", len(over) > 0, long_txt)
+    long_txt = "、".join(f"{n}MA {t[f'MA{n}']:.2f}" for n in (120, 240) if _ok(t[f"MA{n}"]))
+    c3 = Check(names[2], bool(over), long_txt or "長均線資料不足")
 
-    # 5. 盤整區間
-    base = df.iloc[-p["base_window"]:]
-    rng = base["High"].max() / base["Low"].min() - 1
-    c5 = Check("盤整震盪", rng <= p["max_range"],
-               f"近{p['base_window']}日高低差 {_pct(rng)}（上限 {_pct(p['max_range'])}）")
+    top = max(longs) if longs else None
+    c4 = Check(names[3], bool(over) and top is not None and close > top,
+               f"收盤 {close:.2f}，長均線最高 {top:.2f}" if top else "長均線資料不足")
 
-    checks = [c1, c2, c3, c4, c5]
-
-    # 是否剛突破上方長均線
-    cap = min(over) if over else (max(longs) if longs else None)
-    breakout = False
-    if longs:
-        top = max(longs)
-        win = df.iloc[-p["breakout_days"] - 1:]
-        long_series = df[["MA120", "MA240"]].max(axis=1).iloc[-p["breakout_days"] - 1:]
-        was_below = (win["Close"].iloc[:-1] <= long_series.iloc[:-1]).any()
-        vol_ok = t["Volume"] >= t["VMA20"] * p["vol_mult"] or \
-            (win["Volume"].iloc[1:] >= win["VMA20"].iloc[1:] * p["vol_mult"]).any()
-        breakout = close > top and was_below and vol_ok
-
-    bias = close / ma60 - 1
-    stack = [t["MA5"], t["MA10"], t["MA20"], ma60, ma120] + ([ma240] if ma240 else [])
-    bull_stack = all(a > b for a, b in zip(stack, stack[1:]))
-
-    warnings = exit_warnings(df, p)
-
-    base_ok = c1.passed and c2.passed and c3.passed
-    if breakout and c2.passed and c3.passed:
-        if bias <= p["max_bias"]:
-            res = Result("breakout", "🟡 剛突破長均線，起漲訊號",
-                         f"股價在 {p['breakout_days']} 天內放量突破上方長均線，距 60MA 乖離 {_pct(bias)}，尚未過度追高。")
-        else:
-            res = Result("extended", "⚪ 已突破但乖離偏大",
-                         f"已突破長均線，但距 60MA 乖離 {_pct(bias)}，超過 {_pct(p['max_bias'])}，進場容易買在短線高點。")
-    elif base_ok and c4.passed and c5.passed and cap is not None and close < cap:
-        res = Result("setup", "🟢 金包銀成形，可留意布局",
-                     f"股價在 60MA（{ma60:.2f}）與上方長均線（{cap:.2f}）之間整理，符合起漲前的型態。")
-    elif bull_stack:
-        res = Result("extended", "⚪ 已多頭排列，非起漲點",
-                     f"均線已由短到長向上排列，行情已發動。距 60MA 乖離 {_pct(bias)}，不建議追高。")
+    if c4.passed:
+        stage = "突破發動（K棒 > 長均線 > 60MA）"
+    elif c1.passed and c3.passed:
+        stage = "發動前夾擠（長均線 > K棒 > 60MA）"
+    elif c1.passed and not over:
+        stage = "已在長均線之上，不是起漲點"
     else:
-        passed = sum(c.passed for c in checks)
-        res = Result("none", "🔴 目前不符合金包銀",
-                     f"五項條件符合 {passed} 項，建議放入觀察名單，等條件到齊再看。")
-
-    res.checks, res.warnings, res.df = checks, warnings, df
-    return res
+        stage = "金包銀尚未成形"
+    return [c1, c2, c3, c4], stage
 
 
-def exit_warnings(df: pd.DataFrame, p: dict = PARAMS) -> list:
-    """回傳出場警示文字清單（以最新一天為準）。"""
+# ---------- 日K：確認趨勢（正多頭開花） ----------
+def daily_checks(d: pd.DataFrame, p: dict) -> list:
+    t = d.iloc[-1]
+    n = p["d_rise_days"]
+    c5 = Check("K棒站上 5MA（未被蓋頭）", t["Close"] > t["MA5"],
+               f"收盤 {t['Close']:.2f}，5MA {t['MA5']:.2f}")
+    c6 = Check("5MA > 10MA > 20MA", t["MA5"] > t["MA10"] > t["MA20"],
+               f"{t['MA5']:.2f} / {t['MA10']:.2f} / {t['MA20']:.2f}")
+    short_min = min(t["MA5"], t["MA10"], t["MA20"])
+    long_max = max(t["MA60"], t["MA120"])
+    c7 = Check("短均線在 60MA、120MA 之上", short_min > long_max,
+               f"短均線最低 {short_min:.2f}，60/120MA 最高 {long_max:.2f}")
+    rising = {m: d[f"MA{m}"].iloc[-1] > d[f"MA{m}"].iloc[-1 - n] for m in (5, 10, 20, 60)}
+    c8 = Check("均線全部向上發散", all(rising.values()),
+               "、".join(f"{m}MA{'↑' if r else '↓'}" for m, r in rising.items()))
+    return [c5, c6, c7, c8]
+
+
+# ---------- 週K：判斷位階（安全防護網） ----------
+def weekly_checks(w: pd.DataFrame, p: dict) -> list:
+    t = w.iloc[-1]
+    if not _ok(t["MA20"]):
+        return [Check("週K站上週 20MA", None, "週K 資料不足"),
+                Check("週K乖離在安全區", None, "週K 資料不足")]
+    bias = t["Close"] / t["MA20"] - 1
+    c9 = Check("週K站上週 20MA", t["Close"] > t["MA20"],
+               f"週收盤 {t['Close']:.2f}，週20MA {t['MA20']:.2f}")
+    c10 = Check("週K乖離在安全區", 0 <= bias <= p["w_safe_bias"],
+                f"距週20MA {_pct(bias)}（安全區 0~{p['w_safe_bias'] * 100:.0f}%）")
+    return [c9, c10]
+
+
+# ---------- 第四類：風控硬性條件（只警示） ----------
+def risk_checks(d: pd.DataFrame, w: pd.DataFrame, h: pd.DataFrame | None, p: dict) -> list:
     out = []
-    t = df.iloc[-1]
-    recent = df.iloc[-6:]
+    t = d.iloc[-1]
 
-    # 高檔爆量黑K（近 5 天內）
-    hi60 = df["High"].iloc[-60:].max()
+    if t["Close"] < t["MA5"] and t["MA5"] < d["MA5"].iloc[-2]:
+        out.append("日K 蓋頭反壓：跌破 5MA 且 5MA 下彎，持有者應考慮出場")
+    k = p["below5_days"]
+    if (d["Close"].iloc[-k:] < d["MA5"].iloc[-k:]).all():
+        out.append(f"日K 已連續 {k} 天以上站不回 5MA，符合硬性出場條件")
+    if t["Close"] < t["MA60"]:
+        out.append("日K 收盤在 60MA（生命線）之下")
+
+    wt = w.iloc[-1]
+    if _ok(wt["MA20"]):
+        bias = wt["Close"] / wt["MA20"] - 1
+        if bias > p["w_danger_bias"]:
+            out.append(f"週K 正乖離過大（距週20MA {_pct(bias)}），可能是最後一波，只宜極短線")
+
+    if h is not None and len(h) > p["h_slope_bars"] + 1:
+        prev = h["MA60"].iloc[-1 - p["h_slope_bars"]]
+        if _ok(prev) and h["MA60"].iloc[-1] / prev - 1 < p["h_flat_tolerance"]:
+            out.append("60分K 的 60MA 正在下彎，金包銀不成立")
+
+    recent = d.iloc[-6:]
+    hi60 = d["High"].iloc[-60:].max()
     for i in range(len(recent)):
         r = recent.iloc[i]
         if (r["Close"] < r["Open"] and r["Volume"] >= r["VMA20"] * p["big_vol_mult"]
                 and r["High"] >= hi60 * (1 - p["high_zone"])):
-            days_after = len(recent) - 1 - i
-            msg = f"{recent.index[i]:%m/%d} 出現高檔爆量黑K，進入警戒"
-            if days_after >= 3 and recent["High"].iloc[i + 1:].max() <= r["High"]:
-                msg += f"；之後 {days_after} 天都沒有創高，上攻無力"
+            msg = f"{recent.index[i]:%m/%d} 出現高檔爆量黑K"
+            after = len(recent) - 1 - i
+            if after >= 3 and recent["High"].iloc[i + 1:].max() <= r["High"]:
+                msg += f"，之後 {after} 天沒有創高，上攻無力"
             out.append(msg)
             break
-
-    # 跌破 5MA 且 5MA 下彎
-    if t["Close"] < t["MA5"] and t["MA5"] < df["MA5"].iloc[-2]:
-        out.append("跌破 5 日均線且 5MA 下彎（蓋頭反壓），短線應考慮出場")
-
-    # 跌破 60MA
-    if t["Close"] < t["MA60"] and df["Close"].iloc[-2] >= df["MA60"].iloc[-2]:
-        out.append("今日跌破 60MA（生命線）")
     return out
+
+
+def evaluate(daily: pd.DataFrame, hourly: pd.DataFrame | None = None,
+             p: dict = PARAMS) -> Result:
+    if daily is None or len(daily) < 130:
+        return Result("insufficient", "資料不足",
+                      "上市時間太短或查無資料，至少需要約半年的日線資料。")
+
+    d = add_ma(daily)
+    w = to_weekly(daily)
+    h = add_ma(hourly) if hourly is not None and len(hourly) else None
+
+    h_checks, stage = hourly_checks(h, p)
+    groups = [
+        Group("60分K", "找起漲點（金包銀）", h_checks),
+        Group("日K", "確認趨勢（正多頭開花）", daily_checks(d, p)),
+        Group("週K", "判斷位階（安全防護網）", weekly_checks(w, p)),
+    ]
+    score = sum(g.score for g in groups)
+    risks = risk_checks(d, w, h, p)
+
+    if score >= 80:
+        level, title = "strong", f"🟢 {score} 分　高度符合"
+    elif score >= 60:
+        level, title = "watch", f"🟡 {score} 分　部分符合，列入觀察"
+    else:
+        level, title = "weak", f"🔴 {score} 分　目前不符合"
+    summary = f"60分K：{stage}。"
+    if risks:
+        summary += f"另有 {len(risks)} 項風控警示，請先看下方紅框。"
+
+    return Result(level, title, summary, score, groups, risks, d, h, w)

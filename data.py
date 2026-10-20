@@ -96,12 +96,20 @@ def history(code: str):
     return None, None
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def hourly(symbol: str):
+    """單檔 60 分K（約半年，足夠算 240MA）。"""
+    df = yf.Ticker(symbol).history(period="180d", interval="60m", auto_adjust=False)
+    return _clean(df) if not df.empty else None
+
+
 @st.cache_data(ttl=3600 * 6, show_spinner=False)
-def history_batch(symbols: tuple) -> dict:
-    """批次下載多檔日線，回傳 {symbol: df}。"""
+def history_batch(symbols: tuple, interval: str = "1d") -> dict:
+    """批次下載多檔K線（日K 或 60 分K），回傳 {symbol: df}。"""
     out = {}
-    raw = yf.download(list(symbols), period="2y", auto_adjust=False, group_by="ticker",
-                      threads=True, progress=False)
+    period = "2y" if interval == "1d" else "120d"
+    raw = yf.download(list(symbols), period=period, interval=interval, auto_adjust=False,
+                      group_by="ticker", threads=True, progress=False)
     if raw is None or raw.empty:
         return out
     for s in symbols:
