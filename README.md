@@ -5,14 +5,14 @@
 ## 檔案
 
 - `app.py`：網頁介面（Streamlit），分「個股分析」「我的收藏」「選股掃描」三頁
-- `model.py`：金包銀判斷邏輯，所有門檻都在最上方的 `PARAMS`
-- `data.py`：股票清單（證交所、櫃買中心 OpenAPI）與日線資料（Yahoo Finance）
+- `jby_model.py`：金包銀判斷邏輯，所有門檻都在最上方的 `PARAMS`
+- `tw_data.py`：股票清單（證交所、櫃買中心 OpenAPI）與日線資料（Yahoo Finance）
 - `requirements.txt`：需要的套件
 
 ## 部署成網址（一次性，約 10 分鐘）
 
 1. 到 https://github.com 註冊或登入，按右上角「+」→「New repository」，名稱例如 `jinbaoyin`，選 Public，建立。
-2. 在新 repo 頁面按「uploading an existing file」，把 `app.py`、`model.py`、`data.py`、`requirements.txt` 四個檔案拖進去，按「Commit changes」。
+2. 在新 repo 頁面按「uploading an existing file」，把 `app.py`、`jby_model.py`、`tw_data.py`、`requirements.txt` 四個檔案拖進去，按「Commit changes」。
 3. 到 https://share.streamlit.io 用 GitHub 帳號登入，按「Create app」→「Deploy a public app from GitHub」。
 4. Repository 選剛剛的 repo，Branch 填 `main`，Main file path 填 `app.py`，可在 App URL 自訂網址（例如 `jinbaoyin-xxx`），按「Deploy」。
 5. 等一兩分鐘出現頁面後，把網址傳給客戶，請她加到手機主畫面或瀏覽器書籤。

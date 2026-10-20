@@ -3,8 +3,8 @@ import plotly.graph_objects as go
 import streamlit as st
 from streamlit_js_eval import streamlit_js_eval
 
-from data import history, history_batch, hourly, name_of, resolve, stock_list
-from model import evaluate
+from tw_data import history, history_batch, hourly, name_of, resolve, stock_list
+from jby_model import evaluate
 
 st.set_page_config(page_title="金包銀選股小幫手", page_icon="📈", layout="centered")
 
