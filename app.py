@@ -3,8 +3,16 @@ import plotly.graph_objects as go
 import streamlit as st
 from streamlit_js_eval import streamlit_js_eval
 
-from tw_data import history, history_batch, hourly, name_of, resolve, stock_list
-from jby_model import evaluate
+import importlib
+
+import jby_model
+import tw_data
+
+# Streamlit Cloud 更新程式時不一定會重新載入這兩個模組，這裡強制重新載入
+importlib.reload(tw_data)
+importlib.reload(jby_model)
+from tw_data import history, history_batch, hourly, name_of, resolve, stock_list  # noqa: E402
+from jby_model import evaluate  # noqa: E402
 
 st.set_page_config(page_title="金包銀選股小幫手", page_icon="📈", layout="centered")
 
@@ -55,7 +63,7 @@ def chart(d: pd.DataFrame, key: str, bars: int, weekly: bool = False):
     fig = go.Figure()
     fig.add_trace(go.Candlestick(
         x=x, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"],
-        name="K線", increasing_line_color="#e53935", decreasing_line_color="#2e7d32"))
+        name="價格", increasing_line_color="#e53935", decreasing_line_color="#2e7d32"))
     for n, color in [(5, "#ff9800"), (20, "#9c27b0"), (60, "#1e88e5"),
                      (120, "#8d6e63"), (240, "#616161")]:
         fig.add_trace(go.Scatter(x=x, y=d[f"MA{n}"], name=f"{n}MA",
@@ -81,17 +89,32 @@ def show_analysis(code: str, key: str):
     st.markdown(f'<div class="big">{res.title}</div>', unsafe_allow_html=True)
     st.write(res.summary)
 
-    if res.risks:
-        st.error("🚨 風控警示（硬性條件，不計分）\n\n" + "\n".join(f"- {r}" for r in res.risks))
-    elif res.groups:
-        st.success("✅ 風控條件目前都沒有觸發")
-
-    for g in res.groups:
-        st.subheader(f"{g.name}：{g.score} / {g.full} 分")
-        st.caption(g.task)
+    if res.main is not None:
+        g = res.main
+        st.subheader(f"60分K 硬性條件：通過 {g.passed} / {len(g.checks)} 項")
+        st.caption("全部通過＝可購入，少 1~2 項＝可觀察，其餘＝不符合")
         for c in g.checks:
             mark = "⬜" if c.passed is None else ("✅" if c.passed else "❌")
             st.markdown(f"{mark} **{c.name}**　{c.detail}")
+
+        if res.alert_count:
+            lines = []
+            if res.risks:
+                lines.append("**風控警示**")
+                lines += [f"- {r}" for r in res.risks]
+            if res.misses:
+                lines.append("**日K／週K 未通過**")
+                lines += [f"- {m}" for m in res.misses]
+            st.error("🚨 提醒（不影響上面的判斷）\n\n" + "\n".join(lines))
+        else:
+            st.success("✅ 日K、週K 與風控都沒有需要注意的地方")
+
+        with st.expander("日K、週K 參考條件明細"):
+            for g in res.refs:
+                st.markdown(f"**{g.name}：{g.task}**")
+                for c in g.checks:
+                    mark = "⬜" if c.passed is None else ("✅" if c.passed else "❌")
+                    st.markdown(f"{mark} {c.name}　{c.detail}")
 
     if res.daily is not None:
         options = ["日K", "週K"] + (["60分K"] if res.hourly is not None else [])
@@ -106,6 +129,10 @@ def show_analysis(code: str, key: str):
 
 
 # ---------- 多檔掃描 ----------
+LABEL = {"buy": "🟢 通過", "watch": "🟡 部分通過", "fail": "🔴 不符合", "insufficient": "⬜ 資料不足"}
+ORDER = {"buy": 0, "watch": 1, "fail": 2, "insufficient": 3}
+
+
 def scan(universe: pd.DataFrame) -> pd.DataFrame:
     rows = []
     symbols = [f"{c}.{m}" for c, m in zip(universe["code"], universe["market"])]
@@ -118,14 +145,14 @@ def scan(universe: pd.DataFrame) -> pd.DataFrame:
         hours = history_batch(part, interval="60m")
         for sym, df in days.items():
             res = evaluate(df, hours.get(sym))
-            if res.level == "insufficient":
+            if res.main is None:
                 continue
             code = sym.split(".")[0]
-            g = {x.name: x.score for x in res.groups}
             rows.append({
-                "代號": code, "名稱": names.get(code, ""), "總分": res.score,
-                "60分K": g["60分K"], "日K": g["日K"], "週K": g["週K"],
-                "風控警示": len(res.risks), "收盤": round(df["Close"].iloc[-1], 2),
+                "代號": code, "名稱": names.get(code, ""), "判斷": LABEL[res.status],
+                "60分K條件": f"{res.main.passed}/{len(res.main.checks)}",
+                "提醒": res.alert_count, "收盤": round(df["Close"].iloc[-1], 2),
+                "_o": ORDER[res.status], "_n": res.main.passed,
             })
         done = min(i + chunk, len(symbols))
         bar.progress(done / len(symbols), text=f"掃描中… {done}/{len(symbols)}")
@@ -133,7 +160,8 @@ def scan(universe: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-    return out.sort_values(["總分", "風控警示"], ascending=[False, True])
+    out = out.sort_values(["_o", "_n", "提醒"], ascending=[True, False, True])
+    return out.drop(columns=["_o", "_n"])
 
 
 def result_table(df: pd.DataFrame, key: str):
@@ -147,7 +175,7 @@ def result_table(df: pd.DataFrame, key: str):
 tab_one, tab_fav, tab_scan = st.tabs(["🔍 個股分析", "⭐ 我的收藏", "🧭 選股掃描"])
 
 with tab_one:
-    st.caption("輸入台股代號或名稱，依 60分K、日K、週K 三個週期評分（滿分 100），並檢查風控警示。")
+    st.caption("輸入台股代號或名稱，依 60分K 硬性條件判斷能不能進場，日K、週K 與風控有狀況會跳紅框提醒。")
     with st.form("search"):
         q = st.text_input("股票代號或名稱", placeholder="例如 2330、台積電、聯電")
         if st.form_submit_button("開始分析", width="stretch") and q.strip():
@@ -181,11 +209,11 @@ with tab_fav:
                 st.rerun()
 
 with tab_scan:
-    st.caption("從一群股票裡，依三週期評分找出目前分數高的。60分K 資料較多，掃描會比較久。")
+    st.caption("從一群股票裡，依 60分K 硬性條件找出「通過」與「部分通過」的股票。60分K 資料較多，掃描會比較久。")
     scope = st.radio("掃描範圍", ["成交量前 100 名", "成交量前 300 名", "全部上市櫃（約需數分鐘）"],
                      key="scope")
-    show = st.radio("顯示", ["80 分以上", "60 分以上", "全部"], horizontal=True, key="show")
-    no_risk = st.checkbox("排除有風控警示的股票", value=True, key="no_risk")
+    show = st.radio("顯示", ["只看通過", "通過＋部分通過", "全部"], horizontal=True, key="show")
+    no_alert = st.checkbox("排除有紅框提醒的股票", value=False, key="no_alert")
     if st.button("開始掃描", width="stretch", key="scan_run"):
         uni = stock_list()
         n = {"成交量前 100 名": 100, "成交量前 300 名": 300}.get(scope, len(uni))
@@ -195,43 +223,31 @@ with tab_scan:
         if res.empty:
             st.warning("這次沒有抓到資料，請稍後再試。")
         else:
-            min_score = {"80 分以上": 80, "60 分以上": 60}.get(show, 0)
-            view = res[res["總分"] >= min_score]
-            if no_risk:
-                view = view[view["風控警示"] == 0]
+            keep = {"只看通過": ["🟢 通過"], "通過＋部分通過": ["🟢 通過", "🟡 部分通過"]}.get(show)
+            view = res[res["判斷"].isin(keep)] if keep else res
+            if no_alert:
+                view = view[view["提醒"] == 0]
             st.write(f"共掃描 {len(res)} 檔，符合條件 {len(view)} 檔。")
             if len(view):
                 result_table(view, key="scan")
 
-with st.expander("評分方式說明"):
+with st.expander("判斷方式說明"):
     st.markdown("""
-共 10 項條件，每項 10 分，滿分 100 分。
+**60分K 硬性條件（決定判斷結果）**
+1. 股價站上 60MA（生命線）
+2. 60MA 走平或上彎，不可下彎
+3. 120MA 或 240MA 在 60MA 上方（上方有蓋子）
+4. 240MA 在 120MA 上方（長均線由長到短排列，代表前面確實跌過一段）
+5. 突破前約 8 天，至少一半時間在 60MA 與長均線之間整理（金包銀）
+6. 股價突破 120MA 與 240MA（發動）
 
-**60分K：找起漲點（金包銀），40 分**
-- K棒站上 60MA（生命線）
-- 60MA 走平或上彎，不可下彎
-- 120MA 或 240MA 在 60MA 上方壓著（金包銀結構）
-- K棒往上突破長均線（發動點）
+🟢 6 項全過：符合，可購入　🟡 少 1~2 項：可觀察　🔴 其餘：不符合
 
-**日K：確認趨勢（正多頭開花），40 分**
-- K棒站上 5MA，沒有被蓋頭
-- 5MA > 10MA > 20MA
-- 5/10/20MA 都在 60MA、120MA 之上
-- 5、10、20、60MA 全部向上
-
-**週K：判斷位階（安全防護網），20 分**
-- 週K站上週 20MA
-- 距週 20MA 乖離在 0~10% 的安全區
-
-**風控硬性條件（不計分，觸發就警示）**
-- 日K 跌破 5MA 且 5MA 下彎（蓋頭反壓）
-- 日K 連續 3 天站不回 5MA
-- 日K 跌破 60MA
-- 週K 正乖離過大（距週 20MA 超過 20%）
-- 60分K 的 60MA 下彎
-- 高檔爆量黑K、之後 3~4 天無法創高
-
-🟢 80 分以上：高度符合　🟡 60~79 分：列入觀察　🔴 60 分以下：不符合
+**紅框提醒（不影響判斷，有狀況就提醒）**
+- 日K：股價站上 5MA、5MA > 10MA > 20MA、短均線在 60/120MA 之上、均線全部向上，沒通過的會列出
+- 週K：股價站上週 20MA、離週 20MA 在 0~10% 內，沒通過的會列出
+- 風控：日K 跌破 5MA 且 5MA 下彎、連續 3 天站不回 5MA、跌破日 60MA、
+  離週 20MA 超過 20%、高檔爆量收黑後 3 天以上沒創高
 """)
 
 st.markdown('<p class="disclaimer">本工具僅依歷史股價與均線做型態判斷，供參考使用，'
