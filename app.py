@@ -91,6 +91,8 @@ def show_analysis(code: str, key: str):
 
     if res.main is not None:
         g = res.main
+        if res.pattern:
+            st.caption(PATTERN_NOTE[res.pattern])
         st.subheader(f"60分K 硬性條件：通過 {g.passed} / {len(g.checks)} 項")
         st.caption("全部通過＝可購入，少 1~2 項＝可觀察，其餘＝不符合")
         for c in g.checks:
@@ -109,7 +111,7 @@ def show_analysis(code: str, key: str):
         else:
             st.success("✅ 日K、週K 與風控都沒有需要注意的地方")
 
-        with st.expander("參考條件明細（60分K 均線排列、日K、週K）"):
+        with st.expander("參考條件明細（日K、週K）"):
             for g in res.refs:
                 st.markdown(f"**{g.name}：{g.task}**")
                 for c in g.checks:
@@ -127,6 +129,11 @@ def show_analysis(code: str, key: str):
             chart(res.hourly, f"{key}_h", 300)
         st.caption("藍色粗線是 60MA（生命線），棕色和灰色是 120MA、240MA（長均線）。")
 
+
+PATTERN_NOTE = {
+    "標準金包銀": "標準金包銀：整理時 240MA > 120MA > 60MA，長均線明顯壓在上方，突破後通常力道較大。",
+    "均線糾結突破": "均線糾結突破：60、120、240MA 幾乎黏在一起，上方壓力較薄，不是教科書上的金包銀，但突破後也常發動。",
+}
 
 # ---------- 多檔掃描 ----------
 LABEL = {"buy": "🟢 通過", "watch": "🟡 部分通過", "fail": "🔴 不符合", "insufficient": "⬜ 資料不足"}
@@ -150,6 +157,7 @@ def scan(universe: pd.DataFrame) -> pd.DataFrame:
             code = sym.split(".")[0]
             rows.append({
                 "代號": code, "名稱": names.get(code, ""), "判斷": LABEL[res.status],
+                "型態": res.pattern or "",
                 "60分K條件": f"{res.main.passed}/{len(res.main.checks)}",
                 "提醒": res.alert_count, "收盤": round(df["Close"].iloc[-1], 2),
                 "_o": ORDER[res.status], "_n": res.main.passed,
@@ -240,10 +248,11 @@ with st.expander("判斷方式說明"):
 4. 突破前約 8 天，至少一半時間在 60/120/240MA 區間內整理（上下各放寬 2%）
 5. 股價突破 120MA 與 240MA（發動）
 
+結果會標示型態：整理時多數時間 240MA > 120MA > 60MA 為「標準金包銀」，三條線黏在一起為「均線糾結突破」。
+
 🟢 5 項全過：符合，可購入　🟡 少 1~2 項：可觀察　🔴 其餘：不符合
 
 **紅框提醒（不影響判斷，有狀況就提醒）**
-- 60分K：240MA 在 120MA 上方（前面跌過一段），沒通過會列出
 - 日K：股價站上 5MA、5MA > 10MA > 20MA、短均線在 60/120MA 之上、均線全部向上，沒通過的會列出
 - 週K：股價站上週 20MA、離週 20MA 在 0~10% 內，沒通過的會列出
 - 風控：日K 跌破 5MA 且 5MA 下彎、連續 3 天站不回 5MA、跌破日 60MA、

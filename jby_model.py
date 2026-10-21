@@ -57,6 +57,7 @@ class Result:
     title: str
     summary: str
     main: Group | None = None                       # 60分K 硬性條件
+    pattern: str | None = None                      # 標準金包銀 / 均線糾結突破
     refs: list = field(default_factory=list)        # 日K、週K 參考條件
     risks: list = field(default_factory=list)       # 風控警示文字
     daily: pd.DataFrame | None = None
@@ -103,14 +104,18 @@ H_NAMES = [
     "突破前在均線區間內整理（金包銀）",
     "股價突破 120MA 與 240MA（發動）",
 ]
-H_REF_NAME = "240MA 在 120MA 上方（前面跌過一段）"
+PATTERN_STD = "標準金包銀"
+PATTERN_TANGLE = "均線糾結突破"
 
 
 def hourly_checks(h: pd.DataFrame | None, p: dict) -> tuple[list, list, str]:
-    """回傳（硬性條件, 參考條件, 階段說明）。"""
+    """回傳（硬性條件, 型態, 階段說明）。
+
+    型態：整理期間多數時間 240MA > 120MA > 60MA 為「標準金包銀」，否則為「均線糾結突破」。
+    """
     if h is None or len(h) < 250 or not _ok(h["MA240"].iloc[-1]):
         return ([Check(n, None, "60分K 資料不足") for n in H_NAMES],
-                [Check(H_REF_NAME, None, "60分K 資料不足")], "60分K 資料不足")
+                None, "60分K 資料不足")
     t = h.iloc[-1]
     close, ma60, ma120, ma240 = t["Close"], t["MA60"], t["MA120"], t["MA240"]
     top = max(ma120, ma240)
@@ -138,7 +143,8 @@ def hourly_checks(h: pd.DataFrame | None, p: dict) -> tuple[list, list, str]:
 
     c5 = Check(H_NAMES[4], close > top, f"收盤 {close:.2f}，長均線較高者 {top:.2f}")
 
-    ref = Check(H_REF_NAME, ma240 > ma120, f"240MA {ma240:.2f}，120MA {ma120:.2f}")
+    stacked = ((base["MA240"] > base["MA120"]) & (base["MA120"] > base["MA60"])).mean()
+    pattern = PATTERN_STD if stacked >= 0.5 else PATTERN_TANGLE
 
     if c5.passed and c3.passed:
         stage = "突破發動（股價站上糾結或壓頂的長均線）"
@@ -148,7 +154,7 @@ def hourly_checks(h: pd.DataFrame | None, p: dict) -> tuple[list, list, str]:
         stage = "60MA 已明顯高於長均線，不是起漲點"
     else:
         stage = "金包銀尚未成形"
-    return [c1, c2, c3, c4, c5], [ref], stage
+    return [c1, c2, c3, c4, c5], pattern, stage
 
 
 # ---------- 日K：確認趨勢（參考，不影響判斷） ----------
@@ -227,10 +233,9 @@ def evaluate(daily: pd.DataFrame, hourly: pd.DataFrame | None = None,
     w = to_weekly(daily)
     h = add_ma(hourly) if hourly is not None and len(hourly) else None
 
-    h_checks, h_refs, stage = hourly_checks(h, p)
+    h_checks, pattern, stage = hourly_checks(h, p)
     main = Group("60分K", "找起漲點（金包銀）硬性條件", h_checks)
-    refs = [Group("60分K", "長均線排列", h_refs),
-            Group("日K", "確認趨勢（正多頭開花）", daily_checks(d, p)),
+    refs = [Group("日K", "確認趨勢（正多頭開花）", daily_checks(d, p)),
             Group("週K", "判斷位階（避免買在天價）", weekly_checks(w, p))]
     risks = risk_checks(d, w, h, p)
 
@@ -244,7 +249,12 @@ def evaluate(daily: pd.DataFrame, hourly: pd.DataFrame | None = None,
     else:
         status, title = "fail", f"🔴 不符合（{main.passed}/{total}）"
 
-    res = Result(status, title, f"60分K：{stage}。", main, refs, risks, d, h, w)
+    if status not in ("buy", "watch") or not h_checks[2].passed:
+        pattern = None   # 沒有「蓋子」就不算這兩種型態
+    if pattern:
+        title += f"・{pattern}"
+    res = Result(status, title, f"60分K：{stage}。", main=main, pattern=pattern, refs=refs,
+                 risks=risks, daily=d, hourly=h, weekly=w)
     if res.alert_count:
         res.summary += f"另有 {res.alert_count} 項提醒，請看下方紅框。"
     return res
