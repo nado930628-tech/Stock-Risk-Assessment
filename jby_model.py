@@ -1,6 +1,6 @@
 """新式形態學判斷模型（硬性條件制）。
 
-主判斷只看 60分K 的 6 項硬性條件：
+主判斷只看 60分K 的 5 項硬性條件：
   全部通過 → 符合，可購入；少 1~2 項 → 可觀察；其餘 → 不符合。
 日K、週K 條件與風控警示不影響判斷，但沒通過或被觸發時會列進紅框提醒。
 所有門檻集中在 PARAMS，方便日後調整。
@@ -14,7 +14,9 @@ PARAMS = {
     "h_flat_tolerance": -0.003, # 60分K：60MA 跌幅不超過 0.3% 視為走平
     "h_base_bars": 40,          # 60分K：整理區間觀察根數（約 8 個交易日）
     "h_base_skip": 5,           # 60分K：觀察整理區間時略過最近幾根（突破那幾根）
-    "h_base_ratio": 0.5,        # 60分K：至少一半時間在 60MA 與長均線之間
+    "h_base_ratio": 0.5,        # 60分K：至少一半時間在均線區間內
+    "h_band_tol": 0.02,         # 60分K：整理區間上下各放寬 2%
+    "h_tangle_tol": 0.01,       # 60分K：長均線與 60MA 差距 1% 內視為糾結，也算有蓋子
     "watch_max_miss": 2,        # 少幾項以內算「可觀察」
     "d_rise_days": 3,           # 日K：均線與幾天前比較，判斷是否向上
     "w_safe_bias": 0.10,        # 週K：距週20MA 乖離 10% 內算安全區
@@ -32,6 +34,10 @@ class Check:
     name: str
     passed: bool | None   # None = 資料不足
     detail: str
+
+    def __post_init__(self):
+        if self.passed is not None:
+            self.passed = bool(self.passed)   # numpy 的 True/False 轉成一般布林值
 
 
 @dataclass
@@ -93,16 +99,18 @@ def _ok(x) -> bool:
 H_NAMES = [
     "股價站上 60MA（生命線）",
     "60MA 走平或上彎（不可下彎）",
-    "長均線在 60MA 上方（上方有蓋子）",
-    "240MA 在 120MA 上方（長均線由長到短排列）",
-    "突破前在 60MA 與長均線之間整理（金包銀）",
+    "長均線在 60MA 上方或與 60MA 糾結（上方有蓋子）",
+    "突破前在均線區間內整理（金包銀）",
     "股價突破 120MA 與 240MA（發動）",
 ]
+H_REF_NAME = "240MA 在 120MA 上方（前面跌過一段）"
 
 
-def hourly_checks(h: pd.DataFrame | None, p: dict) -> tuple[list, str]:
+def hourly_checks(h: pd.DataFrame | None, p: dict) -> tuple[list, list, str]:
+    """回傳（硬性條件, 參考條件, 階段說明）。"""
     if h is None or len(h) < 250 or not _ok(h["MA240"].iloc[-1]):
-        return [Check(n, None, "60分K 資料不足") for n in H_NAMES], "60分K 資料不足"
+        return ([Check(n, None, "60分K 資料不足") for n in H_NAMES],
+                [Check(H_REF_NAME, None, "60分K 資料不足")], "60分K 資料不足")
     t = h.iloc[-1]
     close, ma60, ma120, ma240 = t["Close"], t["MA60"], t["MA120"], t["MA240"]
     top = max(ma120, ma240)
@@ -114,27 +122,33 @@ def hourly_checks(h: pd.DataFrame | None, p: dict) -> tuple[list, str]:
     c2 = Check(H_NAMES[1], slope >= p["h_flat_tolerance"],
                f"60MA 與 {p['h_slope_bars']} 根前相比 {_pct(slope)}")
 
-    c3 = Check(H_NAMES[2], top > ma60, f"長均線較高者 {top:.2f}，60MA {ma60:.2f}")
-    c4 = Check(H_NAMES[3], ma240 > ma120, f"240MA {ma240:.2f}，120MA {ma120:.2f}")
+    gap = top / ma60 - 1
+    c3 = Check(H_NAMES[2], gap >= -p["h_tangle_tol"],
+               f"長均線較高者 {top:.2f}，60MA {ma60:.2f}，差距 {_pct(gap)}"
+               f"（低於 60MA 不超過 {p['h_tangle_tol'] * 100:.0f}% 都算）")
 
     base = h.iloc[-p["h_base_bars"] - p["h_base_skip"]:-p["h_base_skip"]]
-    upper = base[["MA120", "MA240"]].max(axis=1)
-    inside = ((base["Close"] >= base["MA60"]) & (base["Close"] <= upper)).mean()
-    c5 = Check(H_NAMES[4], inside >= p["h_base_ratio"],
-               f"前 {p['h_base_bars']} 根中有 {inside * 100:.0f}% 時間在區間內"
-               f"（需 {p['h_base_ratio'] * 100:.0f}% 以上）")
+    mas = base[["MA60", "MA120", "MA240"]]
+    lo = mas.min(axis=1) * (1 - p["h_band_tol"])
+    hi = mas.max(axis=1) * (1 + p["h_band_tol"])
+    inside = ((base["Close"] >= lo) & (base["Close"] <= hi)).mean()
+    c4 = Check(H_NAMES[3], inside >= p["h_base_ratio"],
+               f"前 {p['h_base_bars']} 根中有 {inside * 100:.0f}% 時間在 60/120/240MA 區間"
+               f"（上下各放寬 {p['h_band_tol'] * 100:.0f}%）內，需 {p['h_base_ratio'] * 100:.0f}% 以上")
 
-    c6 = Check(H_NAMES[5], close > top, f"收盤 {close:.2f}，長均線較高者 {top:.2f}")
+    c5 = Check(H_NAMES[4], close > top, f"收盤 {close:.2f}，長均線較高者 {top:.2f}")
 
-    if c6.passed and c3.passed:
-        stage = "突破發動（股價 > 長均線 > 60MA）"
-    elif c1.passed and close <= top and c3.passed:
+    ref = Check(H_REF_NAME, ma240 > ma120, f"240MA {ma240:.2f}，120MA {ma120:.2f}")
+
+    if c5.passed and c3.passed:
+        stage = "突破發動（股價站上糾結或壓頂的長均線）"
+    elif c1.passed and c3.passed:
         stage = "發動前夾擠（長均線 > 股價 > 60MA）"
-    elif c1.passed and not c3.passed:
-        stage = "60MA 已在長均線之上，不是起漲點"
+    elif c1.passed:
+        stage = "60MA 已明顯高於長均線，不是起漲點"
     else:
         stage = "金包銀尚未成形"
-    return [c1, c2, c3, c4, c5, c6], stage
+    return [c1, c2, c3, c4, c5], [ref], stage
 
 
 # ---------- 日K：確認趨勢（參考，不影響判斷） ----------
@@ -213,9 +227,10 @@ def evaluate(daily: pd.DataFrame, hourly: pd.DataFrame | None = None,
     w = to_weekly(daily)
     h = add_ma(hourly) if hourly is not None and len(hourly) else None
 
-    h_checks, stage = hourly_checks(h, p)
+    h_checks, h_refs, stage = hourly_checks(h, p)
     main = Group("60分K", "找起漲點（金包銀）硬性條件", h_checks)
-    refs = [Group("日K", "確認趨勢（正多頭開花）", daily_checks(d, p)),
+    refs = [Group("60分K", "長均線排列", h_refs),
+            Group("日K", "確認趨勢（正多頭開花）", daily_checks(d, p)),
             Group("週K", "判斷位階（避免買在天價）", weekly_checks(w, p))]
     risks = risk_checks(d, w, h, p)
 

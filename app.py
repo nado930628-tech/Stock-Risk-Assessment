@@ -103,13 +103,13 @@ def show_analysis(code: str, key: str):
                 lines.append("**風控警示**")
                 lines += [f"- {r}" for r in res.risks]
             if res.misses:
-                lines.append("**日K／週K 未通過**")
+                lines.append("**參考條件未通過**")
                 lines += [f"- {m}" for m in res.misses]
             st.error("🚨 提醒（不影響上面的判斷）\n\n" + "\n".join(lines))
         else:
             st.success("✅ 日K、週K 與風控都沒有需要注意的地方")
 
-        with st.expander("日K、週K 參考條件明細"):
+        with st.expander("參考條件明細（60分K 均線排列、日K、週K）"):
             for g in res.refs:
                 st.markdown(f"**{g.name}：{g.task}**")
                 for c in g.checks:
@@ -236,14 +236,14 @@ with st.expander("判斷方式說明"):
 **60分K 硬性條件（決定判斷結果）**
 1. 股價站上 60MA（生命線）
 2. 60MA 走平或上彎，不可下彎
-3. 120MA 或 240MA 在 60MA 上方（上方有蓋子）
-4. 240MA 在 120MA 上方（長均線由長到短排列，代表前面確實跌過一段）
-5. 突破前約 8 天，至少一半時間在 60MA 與長均線之間整理（金包銀）
-6. 股價突破 120MA 與 240MA（發動）
+3. 120MA 或 240MA 在 60MA 上方，或三條均線糾結在一起（差距 1% 內）
+4. 突破前約 8 天，至少一半時間在 60/120/240MA 區間內整理（上下各放寬 2%）
+5. 股價突破 120MA 與 240MA（發動）
 
-🟢 6 項全過：符合，可購入　🟡 少 1~2 項：可觀察　🔴 其餘：不符合
+🟢 5 項全過：符合，可購入　🟡 少 1~2 項：可觀察　🔴 其餘：不符合
 
 **紅框提醒（不影響判斷，有狀況就提醒）**
+- 60分K：240MA 在 120MA 上方（前面跌過一段），沒通過會列出
 - 日K：股價站上 5MA、5MA > 10MA > 20MA、短均線在 60/120MA 之上、均線全部向上，沒通過的會列出
 - 週K：股價站上週 20MA、離週 20MA 在 0~10% 內，沒通過的會列出
 - 風控：日K 跌破 5MA 且 5MA 下彎、連續 3 天站不回 5MA、跌破日 60MA、
