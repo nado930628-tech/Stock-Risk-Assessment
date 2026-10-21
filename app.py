@@ -92,7 +92,7 @@ def show_analysis(code: str, key: str):
     if res.main is not None:
         g = res.main
         st.subheader(f"60分K 硬性條件：通過 {g.passed} / {len(g.checks)} 項")
-        st.caption("嚴格定義：4 項全部符合才算通過，少任何一項都是未通過")
+        st.caption("5 項全部符合才算通過，少任何一項都是未通過")
         for c in g.checks:
             mark = "⬜" if c.passed is None else ("✅" if c.passed else "❌")
             st.markdown(f"{mark} **{c.name}**　{c.detail}")
@@ -209,7 +209,7 @@ with tab_fav:
                 st.rerun()
 
 with tab_scan:
-    st.caption("從一群股票裡，依 60分K 4 項硬性條件找出「通過」的股票，找不到也是正常的。60分K 資料較多，掃描會比較久。")
+    st.caption("從一群股票裡，依 60分K 5 項硬性條件找出「通過」的股票，找不到也是正常的。60分K 資料較多，掃描會比較久。")
     scope = st.radio("掃描範圍", ["成交量前 100 名", "成交量前 300 名", "全部上市櫃（約需數分鐘）"],
                      key="scope")
     show = st.radio("顯示", ["只看通過", "全部"], horizontal=True, key="show")
@@ -233,13 +233,14 @@ with tab_scan:
 
 with st.expander("判斷方式說明"):
     st.markdown("""
-**60分K 硬性條件（決定判斷結果，4 項全部符合才通過）**
-1. 60MA 往上彎：比 20 根前高，平均成本不再往下掉
-2. 20MA 站上 60MA：短期買家轉為獲利
-3. 120MA、240MA 都壓在 60MA 上方，突破前約 8 天至少一半時間股價夾在 60MA 與長均線中間整理
-4. 股價突破 120MA 與 240MA：套牢賣壓被消化，正式發動
+**60分K 硬性條件（決定判斷結果，5 項全部符合才通過）**
+1. 股價與 20MA 都站上 60MA（生命線）
+2. 60MA 走平或向上（4 天內跌幅不超過 0.3%）
+3. 120MA 或 240MA 位於 60MA 上方（長線壓頂）
+4. 突破前約 8 天橫盤打底：收盤與 60MA 乖離都在 ±5% 內
+5. 帶量突破：最近 5 根內有一根收盤突破打底期間最高收盤，且成交量 > 前 5 根均量 1.5 倍
 
-🟢 通過　🔴 未通過（沒有容許誤差，找不到符合的股票也是正常的）
+🟢 通過　🔴 未通過
 
 **紅框提醒（不影響判斷，有狀況就提醒）**
 - 日K：股價站上 5MA、5MA > 10MA > 20MA、短均線都在 60/120MA 之上、全均線向上，沒通過的會列出

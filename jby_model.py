@@ -1,6 +1,6 @@
 """新式形態學判斷模型（硬性條件制）。
 
-主判斷只看 60分K 的 4 項硬性條件（嚴格定義，沒有容許誤差）：
+主判斷只看 60分K 的 5 項硬性條件（客戶修正版）：
   全部通過 → 通過；其餘 → 未通過。
 日K、週K 條件與風控警示不影響判斷，但沒通過或被觸發時會列進紅框提醒。
 所有門檻集中在 PARAMS，方便日後調整。
@@ -10,10 +10,13 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 PARAMS = {
-    "h_slope_bars": 20,         # 60分K：60MA 與幾根前比較（約 4 個交易日），要比較高才算上彎
-    "h_base_bars": 40,          # 60分K：整理區間觀察根數（約 8 個交易日）
-    "h_base_skip": 5,           # 60分K：觀察整理區間時略過最近幾根（突破那幾根）
-    "h_base_ratio": 0.5,        # 60分K：整理期間至少一半時間夾在中間
+    "h_slope_bars": 20,         # 60分K：60MA 與幾根前比較（約 4 個交易日）
+    "h_flat_tolerance": -0.003, # 60分K：60MA 跌幅不超過 0.3% 視為走平
+    "h_base_bars": 40,          # 60分K：突破前打底觀察根數（約 8 個交易日）
+    "h_breakout_bars": 5,       # 60分K：最近幾根內出現帶量突破（約 1 個交易日）
+    "h_base_band": 0.05,        # 60分K：打底期間收盤與 60MA 乖離需在 ±5% 內
+    "h_vol_mult": 1.5,          # 60分K：突破那根成交量 > 前 5 根均量 × 1.5
+    "h_vol_bars": 5,            # 60分K：均量用前幾根計算
     "d_rise_days": 3,           # 日K：均線與幾天前比較，判斷是否向上
     "w_safe_bias": 0.10,        # 週K：距週20MA 乖離 10% 內算安全區
     "w_danger_bias": 0.20,      # 週K：距週20MA 乖離超過 20% 算位階過高
@@ -93,48 +96,71 @@ def _ok(x) -> bool:
 
 # ---------- 60分K：硬性條件（主判斷） ----------
 H_NAMES = [
-    "60MA 往上彎（止跌）",
-    "20MA 站上 60MA（短期買家轉為獲利）",
-    "120MA、240MA 壓在上方，股價夾在中間整理（夾心）",
-    "股價突破長均線（發動）",
+    "股價與 20MA 站上 60MA（生命線）",
+    "60MA 走平或向上",
+    "120MA 或 240MA 位於 60MA 上方（長線壓頂）",
+    "突破前 5~8 天橫盤打底（收盤與 60MA 乖離 ±5% 內）",
+    "突破時當根帶量（成交量 > 5 均量 1.5 倍）",
 ]
 
 
 def hourly_checks(h: pd.DataFrame | None, p: dict) -> tuple[list, str]:
-    """回傳（硬性條件, 階段說明）。"""
+    """回傳（硬性條件, 階段說明）。
+
+    「突破」的定義：最近 5 根內有一根收盤高於打底期間最高收盤，且當根成交量 > 前 5 根均量 × 1.5。
+    """
     if h is None or len(h) < 250 or not _ok(h["MA240"].iloc[-1]):
         return [Check(n, None, "60分K 資料不足") for n in H_NAMES], "60分K 資料不足"
     t = h.iloc[-1]
     close, ma20, ma60, ma120, ma240 = t["Close"], t["MA20"], t["MA60"], t["MA120"], t["MA240"]
     top = max(ma120, ma240)
+    nb = p["h_breakout_bars"]
+
+    c1 = Check(H_NAMES[0], close > ma60 and ma20 > ma60,
+               f"收盤 {close:.2f}、20MA {ma20:.2f}，60MA {ma60:.2f}")
 
     prev = h["MA60"].iloc[-1 - p["h_slope_bars"]]
     slope = ma60 / prev - 1
-    c1 = Check(H_NAMES[0], slope > 0, f"60MA 與 {p['h_slope_bars']} 根前相比 {_pct(slope)}（需大於 0）")
+    c2 = Check(H_NAMES[1], slope >= p["h_flat_tolerance"],
+               f"60MA 與 {p['h_slope_bars']} 根前相比 {_pct(slope)}")
 
-    c2 = Check(H_NAMES[1], ma20 > ma60, f"20MA {ma20:.2f}，60MA {ma60:.2f}")
+    c3 = Check(H_NAMES[2], top > ma60,
+               f"120MA {ma120:.2f}、240MA {ma240:.2f}，60MA {ma60:.2f}")
 
-    base = h.iloc[-p["h_base_bars"] - p["h_base_skip"]:-p["h_base_skip"]]
-    sandwich = ((base["MA120"] > base["MA60"]) & (base["MA240"] > base["MA60"])
-                & (base["Close"] > base["MA60"])
-                & (base["Close"] < base[["MA120", "MA240"]].max(axis=1))).mean()
-    lid_now = ma120 > ma60 and ma240 > ma60
-    c3 = Check(H_NAMES[2], lid_now and sandwich >= p["h_base_ratio"],
-               f"目前 120MA {ma120:.2f}、240MA {ma240:.2f}，{'都' if lid_now else '沒有都'}在 60MA {ma60:.2f} 上方；"
-               f"突破前 {p['h_base_bars']} 根有 {sandwich * 100:.0f}% 時間夾在中間"
-               f"（需 {p['h_base_ratio'] * 100:.0f}% 以上）")
+    base = h.iloc[-p["h_base_bars"] - nb:-nb]
+    dev = base["Close"] / base["MA60"] - 1
+    worst = dev.abs().max()
+    c4 = Check(H_NAMES[3], worst <= p["h_base_band"],
+               f"突破前 {p['h_base_bars']} 根收盤與 60MA 乖離介於 {_pct(dev.min())} ~ {_pct(dev.max())}"
+               f"（需在 ±{p['h_base_band'] * 100:.0f}% 內）")
 
-    c4 = Check(H_NAMES[3], close > top, f"收盤 {close:.2f}，120MA／240MA 較高者 {top:.2f}")
+    base_high = base["Close"].max()
+    best, best_ratio, best_time = False, 0.0, None
+    for i in range(len(h) - nb, len(h)):
+        avg = h["Volume"].iloc[i - p["h_vol_bars"]:i].mean()
+        ratio = h["Volume"].iloc[i] / avg if avg > 0 else 0.0
+        broke = h["Close"].iloc[i] > base_high
+        if broke and ratio > best_ratio:
+            best_ratio, best_time = ratio, h.index[i]
+        if broke and ratio > p["h_vol_mult"]:
+            best = True
+    if best_time is None:
+        vol_txt = f"最近 {nb} 根沒有收盤突破打底高點 {base_high:.2f}"
+    else:
+        vol_txt = (f"{best_time:%m/%d %H:%M} 突破打底高點 {base_high:.2f}，"
+                   f"成交量是前 5 根均量的 {best_ratio:.1f} 倍")
+    c5 = Check(H_NAMES[4], best, vol_txt)
 
-    if all(c.passed for c in (c1, c2, c3, c4)):
-        stage = "金包銀突破發動"
-    elif lid_now and ma60 < close <= top:
-        stage = "夾心整理中，尚未突破"
-    elif not lid_now:
-        stage = "上方沒有 120MA、240MA 同時壓著，不是金包銀型態"
+    checks = [c1, c2, c3, c4, c5]
+    if all(c.passed for c in checks):
+        stage = "打底完成，帶量發動"
+    elif c1.passed and c2.passed and c3.passed and c4.passed:
+        stage = "橫盤打底中，還沒出現帶量突破"
+    elif not c3.passed:
+        stage = "上方沒有長均線壓頂，不是金包銀架構"
     else:
         stage = "金包銀尚未成形"
-    return [c1, c2, c3, c4], stage
+    return checks, stage
 
 
 # ---------- 日K：確認趨勢（參考，不影響判斷） ----------
