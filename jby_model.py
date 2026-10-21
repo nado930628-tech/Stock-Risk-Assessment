@@ -1,7 +1,7 @@
 """新式形態學判斷模型（硬性條件制）。
 
-主判斷只看 60分K 的 5 項硬性條件：
-  全部通過 → 符合，可購入；少 1~2 項 → 可觀察；其餘 → 不符合。
+主判斷只看 60分K 的 4 項硬性條件（嚴格定義，沒有容許誤差）：
+  全部通過 → 通過；其餘 → 未通過。
 日K、週K 條件與風控警示不影響判斷，但沒通過或被觸發時會列進紅框提醒。
 所有門檻集中在 PARAMS，方便日後調整。
 """
@@ -10,17 +10,13 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 PARAMS = {
-    "h_slope_bars": 20,         # 60分K：60MA 與幾根前比較（約 4 個交易日）
-    "h_flat_tolerance": -0.003, # 60分K：60MA 跌幅不超過 0.3% 視為走平
+    "h_slope_bars": 20,         # 60分K：60MA 與幾根前比較（約 4 個交易日），要比較高才算上彎
     "h_base_bars": 40,          # 60分K：整理區間觀察根數（約 8 個交易日）
     "h_base_skip": 5,           # 60分K：觀察整理區間時略過最近幾根（突破那幾根）
-    "h_base_ratio": 0.5,        # 60分K：至少一半時間在均線區間內
-    "h_band_tol": 0.02,         # 60分K：整理區間上下各放寬 2%
-    "h_tangle_tol": 0.01,       # 60分K：長均線與 60MA 差距 1% 內視為糾結，也算有蓋子
-    "watch_max_miss": 2,        # 少幾項以內算「可觀察」
+    "h_base_ratio": 0.5,        # 60分K：整理期間至少一半時間夾在中間
     "d_rise_days": 3,           # 日K：均線與幾天前比較，判斷是否向上
     "w_safe_bias": 0.10,        # 週K：距週20MA 乖離 10% 內算安全區
-    "w_danger_bias": 0.20,      # 週K：距週20MA 乖離超過 20% 算危險區
+    "w_danger_bias": 0.20,      # 週K：距週20MA 乖離超過 20% 算位階過高
     "below5_days": 3,           # 日K：跌破 5MA 連續幾天站不回算硬性出場
     "big_vol_mult": 2.0,        # 爆量：成交量 >= 20 日均量 × 2
     "high_zone": 0.05,          # 距近 60 日高點 5% 內算高檔
@@ -53,11 +49,10 @@ class Group:
 
 @dataclass
 class Result:
-    status: str          # buy / watch / fail / insufficient
+    status: str          # pass / fail / insufficient
     title: str
     summary: str
     main: Group | None = None                       # 60分K 硬性條件
-    pattern: str | None = None                      # 標準金包銀 / 均線糾結突破
     refs: list = field(default_factory=list)        # 日K、週K 參考條件
     risks: list = field(default_factory=list)       # 風控警示文字
     daily: pd.DataFrame | None = None
@@ -98,63 +93,48 @@ def _ok(x) -> bool:
 
 # ---------- 60分K：硬性條件（主判斷） ----------
 H_NAMES = [
-    "股價站上 60MA（生命線）",
-    "60MA 走平或上彎（不可下彎）",
-    "長均線在 60MA 上方或與 60MA 糾結（上方有蓋子）",
-    "突破前在均線區間內整理（金包銀）",
-    "股價突破 120MA 與 240MA（發動）",
+    "60MA 往上彎（止跌）",
+    "20MA 站上 60MA（短期買家轉為獲利）",
+    "120MA、240MA 壓在上方，股價夾在中間整理（夾心）",
+    "股價突破長均線（發動）",
 ]
-PATTERN_STD = "標準金包銀"
-PATTERN_TANGLE = "均線糾結突破"
 
 
-def hourly_checks(h: pd.DataFrame | None, p: dict) -> tuple[list, list, str]:
-    """回傳（硬性條件, 型態, 階段說明）。
-
-    型態：整理期間多數時間 240MA > 120MA > 60MA 為「標準金包銀」，否則為「均線糾結突破」。
-    """
+def hourly_checks(h: pd.DataFrame | None, p: dict) -> tuple[list, str]:
+    """回傳（硬性條件, 階段說明）。"""
     if h is None or len(h) < 250 or not _ok(h["MA240"].iloc[-1]):
-        return ([Check(n, None, "60分K 資料不足") for n in H_NAMES],
-                None, "60分K 資料不足")
+        return [Check(n, None, "60分K 資料不足") for n in H_NAMES], "60分K 資料不足"
     t = h.iloc[-1]
-    close, ma60, ma120, ma240 = t["Close"], t["MA60"], t["MA120"], t["MA240"]
+    close, ma20, ma60, ma120, ma240 = t["Close"], t["MA20"], t["MA60"], t["MA120"], t["MA240"]
     top = max(ma120, ma240)
-
-    c1 = Check(H_NAMES[0], close > ma60, f"收盤 {close:.2f}，60MA {ma60:.2f}")
 
     prev = h["MA60"].iloc[-1 - p["h_slope_bars"]]
     slope = ma60 / prev - 1
-    c2 = Check(H_NAMES[1], slope >= p["h_flat_tolerance"],
-               f"60MA 與 {p['h_slope_bars']} 根前相比 {_pct(slope)}")
+    c1 = Check(H_NAMES[0], slope > 0, f"60MA 與 {p['h_slope_bars']} 根前相比 {_pct(slope)}（需大於 0）")
 
-    gap = top / ma60 - 1
-    c3 = Check(H_NAMES[2], gap >= -p["h_tangle_tol"],
-               f"長均線較高者 {top:.2f}，60MA {ma60:.2f}，差距 {_pct(gap)}"
-               f"（低於 60MA 不超過 {p['h_tangle_tol'] * 100:.0f}% 都算）")
+    c2 = Check(H_NAMES[1], ma20 > ma60, f"20MA {ma20:.2f}，60MA {ma60:.2f}")
 
     base = h.iloc[-p["h_base_bars"] - p["h_base_skip"]:-p["h_base_skip"]]
-    mas = base[["MA60", "MA120", "MA240"]]
-    lo = mas.min(axis=1) * (1 - p["h_band_tol"])
-    hi = mas.max(axis=1) * (1 + p["h_band_tol"])
-    inside = ((base["Close"] >= lo) & (base["Close"] <= hi)).mean()
-    c4 = Check(H_NAMES[3], inside >= p["h_base_ratio"],
-               f"前 {p['h_base_bars']} 根中有 {inside * 100:.0f}% 時間在 60/120/240MA 區間"
-               f"（上下各放寬 {p['h_band_tol'] * 100:.0f}%）內，需 {p['h_base_ratio'] * 100:.0f}% 以上")
+    sandwich = ((base["MA120"] > base["MA60"]) & (base["MA240"] > base["MA60"])
+                & (base["Close"] > base["MA60"])
+                & (base["Close"] < base[["MA120", "MA240"]].max(axis=1))).mean()
+    lid_now = ma120 > ma60 and ma240 > ma60
+    c3 = Check(H_NAMES[2], lid_now and sandwich >= p["h_base_ratio"],
+               f"目前 120MA {ma120:.2f}、240MA {ma240:.2f}，{'都' if lid_now else '沒有都'}在 60MA {ma60:.2f} 上方；"
+               f"突破前 {p['h_base_bars']} 根有 {sandwich * 100:.0f}% 時間夾在中間"
+               f"（需 {p['h_base_ratio'] * 100:.0f}% 以上）")
 
-    c5 = Check(H_NAMES[4], close > top, f"收盤 {close:.2f}，長均線較高者 {top:.2f}")
+    c4 = Check(H_NAMES[3], close > top, f"收盤 {close:.2f}，120MA／240MA 較高者 {top:.2f}")
 
-    stacked = ((base["MA240"] > base["MA120"]) & (base["MA120"] > base["MA60"])).mean()
-    pattern = PATTERN_STD if stacked >= 0.5 else PATTERN_TANGLE
-
-    if c5.passed and c3.passed:
-        stage = "突破發動（股價站上糾結或壓頂的長均線）"
-    elif c1.passed and c3.passed:
-        stage = "發動前夾擠（長均線 > 股價 > 60MA）"
-    elif c1.passed:
-        stage = "60MA 已明顯高於長均線，不是起漲點"
+    if all(c.passed for c in (c1, c2, c3, c4)):
+        stage = "金包銀突破發動"
+    elif lid_now and ma60 < close <= top:
+        stage = "夾心整理中，尚未突破"
+    elif not lid_now:
+        stage = "上方沒有 120MA、240MA 同時壓著，不是金包銀型態"
     else:
         stage = "金包銀尚未成形"
-    return [c1, c2, c3, c4, c5], pattern, stage
+    return [c1, c2, c3, c4], stage
 
 
 # ---------- 日K：確認趨勢（參考，不影響判斷） ----------
@@ -169,8 +149,9 @@ def daily_checks(d: pd.DataFrame, p: dict) -> list:
     long_max = max(t["MA60"], t["MA120"])
     c3 = Check("短均線在 60MA、120MA 之上", short_min > long_max,
                f"短均線最低 {short_min:.2f}，60/120MA 較高者 {long_max:.2f}")
-    rising = {m: d[f"MA{m}"].iloc[-1] > d[f"MA{m}"].iloc[-1 - n] for m in (5, 10, 20, 60)}
-    c4 = Check("均線全部向上", all(rising.values()),
+    rising = {m: d[f"MA{m}"].iloc[-1] > d[f"MA{m}"].iloc[-1 - n] for m in MA_LIST
+              if _ok(d[f"MA{m}"].iloc[-1 - n])}
+    c4 = Check("全均線向上（多頭開花）", all(rising.values()),
                "、".join(f"{m}MA{'↑' if r else '↓'}" for m, r in rising.items()))
     return [c1, c2, c3, c4]
 
@@ -206,7 +187,12 @@ def risk_checks(d: pd.DataFrame, w: pd.DataFrame, h: pd.DataFrame | None, p: dic
     if _ok(wt["MA20"]):
         bias = wt["Close"] / wt["MA20"] - 1
         if bias > p["w_danger_bias"]:
-            out.append(f"週K 漲離週20MA 太遠（{_pct(bias)}），可能是最後一波，只宜極短線")
+            out.append(f"週K 位階過高（距週20MA {_pct(bias)}），可能是最後一波，只宜極短線")
+
+    if h is not None and len(h) > p["h_slope_bars"] + 1:
+        prev = h["MA60"].iloc[-1 - p["h_slope_bars"]]
+        if _ok(prev) and h["MA60"].iloc[-1] < prev:
+            out.append("60分K 的 60MA 下彎，金包銀的前提與支撐力量消失")
 
     recent = d.iloc[-6:]
     hi60 = d["High"].iloc[-60:].max()
@@ -233,27 +219,21 @@ def evaluate(daily: pd.DataFrame, hourly: pd.DataFrame | None = None,
     w = to_weekly(daily)
     h = add_ma(hourly) if hourly is not None and len(hourly) else None
 
-    h_checks, pattern, stage = hourly_checks(h, p)
-    main = Group("60分K", "找起漲點（金包銀）硬性條件", h_checks)
-    refs = [Group("日K", "確認趨勢（正多頭開花）", daily_checks(d, p)),
-            Group("週K", "判斷位階（避免買在天價）", weekly_checks(w, p))]
+    h_checks, stage = hourly_checks(h, p)
+    main = Group("60分K", "找尋精準進場時點（金包銀點）", h_checks)
+    refs = [Group("日K", "確認趨勢與動能（多頭開花）", daily_checks(d, p)),
+            Group("週K", "判斷位階與防高檔套牢", weekly_checks(w, p))]
     risks = risk_checks(d, w, h, p)
 
     total = len(h_checks)
     if any(c.passed is None for c in h_checks):
         status, title = "insufficient", "⬜ 60分K 資料不足，無法判斷"
     elif main.passed == total:
-        status, title = "buy", f"🟢 符合，可購入（{total}/{total}）"
-    elif main.passed >= total - p["watch_max_miss"]:
-        status, title = "watch", f"🟡 可觀察（{main.passed}/{total}）"
+        status, title = "pass", f"🟢 通過（{total}/{total}）"
     else:
-        status, title = "fail", f"🔴 不符合（{main.passed}/{total}）"
+        status, title = "fail", f"🔴 未通過（{main.passed}/{total}）"
 
-    if status not in ("buy", "watch") or not h_checks[2].passed:
-        pattern = None   # 沒有「蓋子」就不算這兩種型態
-    if pattern:
-        title += f"・{pattern}"
-    res = Result(status, title, f"60分K：{stage}。", main=main, pattern=pattern, refs=refs,
+    res = Result(status, title, f"60分K：{stage}。", main=main, refs=refs,
                  risks=risks, daily=d, hourly=h, weekly=w)
     if res.alert_count:
         res.summary += f"另有 {res.alert_count} 項提醒，請看下方紅框。"

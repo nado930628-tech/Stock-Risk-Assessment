@@ -91,10 +91,8 @@ def show_analysis(code: str, key: str):
 
     if res.main is not None:
         g = res.main
-        if res.pattern:
-            st.caption(PATTERN_NOTE[res.pattern])
         st.subheader(f"60分K 硬性條件：通過 {g.passed} / {len(g.checks)} 項")
-        st.caption("全部通過＝可購入，少 1~2 項＝可觀察，其餘＝不符合")
+        st.caption("嚴格定義：4 項全部符合才算通過，少任何一項都是未通過")
         for c in g.checks:
             mark = "⬜" if c.passed is None else ("✅" if c.passed else "❌")
             st.markdown(f"{mark} **{c.name}**　{c.detail}")
@@ -130,14 +128,9 @@ def show_analysis(code: str, key: str):
         st.caption("藍色粗線是 60MA（生命線），棕色和灰色是 120MA、240MA（長均線）。")
 
 
-PATTERN_NOTE = {
-    "標準金包銀": "標準金包銀：整理時 240MA > 120MA > 60MA，長均線明顯壓在上方，突破後通常力道較大。",
-    "均線糾結突破": "均線糾結突破：60、120、240MA 幾乎黏在一起，上方壓力較薄，不是教科書上的金包銀，但突破後也常發動。",
-}
-
 # ---------- 多檔掃描 ----------
-LABEL = {"buy": "🟢 通過", "watch": "🟡 部分通過", "fail": "🔴 不符合", "insufficient": "⬜ 資料不足"}
-ORDER = {"buy": 0, "watch": 1, "fail": 2, "insufficient": 3}
+LABEL = {"pass": "🟢 通過", "fail": "🔴 未通過", "insufficient": "⬜ 資料不足"}
+ORDER = {"pass": 0, "fail": 1, "insufficient": 2}
 
 
 def scan(universe: pd.DataFrame) -> pd.DataFrame:
@@ -157,7 +150,6 @@ def scan(universe: pd.DataFrame) -> pd.DataFrame:
             code = sym.split(".")[0]
             rows.append({
                 "代號": code, "名稱": names.get(code, ""), "判斷": LABEL[res.status],
-                "型態": res.pattern or "",
                 "60分K條件": f"{res.main.passed}/{len(res.main.checks)}",
                 "提醒": res.alert_count, "收盤": round(df["Close"].iloc[-1], 2),
                 "_o": ORDER[res.status], "_n": res.main.passed,
@@ -217,10 +209,10 @@ with tab_fav:
                 st.rerun()
 
 with tab_scan:
-    st.caption("從一群股票裡，依 60分K 硬性條件找出「通過」與「部分通過」的股票。60分K 資料較多，掃描會比較久。")
+    st.caption("從一群股票裡，依 60分K 4 項硬性條件找出「通過」的股票，找不到也是正常的。60分K 資料較多，掃描會比較久。")
     scope = st.radio("掃描範圍", ["成交量前 100 名", "成交量前 300 名", "全部上市櫃（約需數分鐘）"],
                      key="scope")
-    show = st.radio("顯示", ["只看通過", "通過＋部分通過", "全部"], horizontal=True, key="show")
+    show = st.radio("顯示", ["只看通過", "全部"], horizontal=True, key="show")
     no_alert = st.checkbox("排除有紅框提醒的股票", value=False, key="no_alert")
     if st.button("開始掃描", width="stretch", key="scan_run"):
         uni = stock_list()
@@ -231,7 +223,7 @@ with tab_scan:
         if res.empty:
             st.warning("這次沒有抓到資料，請稍後再試。")
         else:
-            keep = {"只看通過": ["🟢 通過"], "通過＋部分通過": ["🟢 通過", "🟡 部分通過"]}.get(show)
+            keep = ["🟢 通過"] if show == "只看通過" else None
             view = res[res["判斷"].isin(keep)] if keep else res
             if no_alert:
                 view = view[view["提醒"] == 0]
@@ -241,22 +233,19 @@ with tab_scan:
 
 with st.expander("判斷方式說明"):
     st.markdown("""
-**60分K 硬性條件（決定判斷結果）**
-1. 股價站上 60MA（生命線）
-2. 60MA 走平或上彎，不可下彎
-3. 120MA 或 240MA 在 60MA 上方，或三條均線糾結在一起（差距 1% 內）
-4. 突破前約 8 天，至少一半時間在 60/120/240MA 區間內整理（上下各放寬 2%）
-5. 股價突破 120MA 與 240MA（發動）
+**60分K 硬性條件（決定判斷結果，4 項全部符合才通過）**
+1. 60MA 往上彎：比 20 根前高，平均成本不再往下掉
+2. 20MA 站上 60MA：短期買家轉為獲利
+3. 120MA、240MA 都壓在 60MA 上方，突破前約 8 天至少一半時間股價夾在 60MA 與長均線中間整理
+4. 股價突破 120MA 與 240MA：套牢賣壓被消化，正式發動
 
-結果會標示型態：整理時多數時間 240MA > 120MA > 60MA 為「標準金包銀」，三條線黏在一起為「均線糾結突破」。
-
-🟢 5 項全過：符合，可購入　🟡 少 1~2 項：可觀察　🔴 其餘：不符合
+🟢 通過　🔴 未通過（沒有容許誤差，找不到符合的股票也是正常的）
 
 **紅框提醒（不影響判斷，有狀況就提醒）**
-- 日K：股價站上 5MA、5MA > 10MA > 20MA、短均線在 60/120MA 之上、均線全部向上，沒通過的會列出
-- 週K：股價站上週 20MA、離週 20MA 在 0~10% 內，沒通過的會列出
-- 風控：日K 跌破 5MA 且 5MA 下彎、連續 3 天站不回 5MA、跌破日 60MA、
-  離週 20MA 超過 20%、高檔爆量收黑後 3 天以上沒創高
+- 日K：股價站上 5MA、5MA > 10MA > 20MA、短均線都在 60/120MA 之上、全均線向上，沒通過的會列出
+- 週K：股價站上週 20MA、離週 20MA 乖離不超過 10%，沒通過的會列出
+- 風控：日K 跌破 5MA 且 5MA 下彎、連續 3 天站不回 5MA、跌破日 60MA、60分K 的 60MA 下彎、
+  週K 位階過高（離週 20MA 超過 20%）、高檔爆量收黑後 3 天以上沒創高
 """)
 
 st.markdown('<p class="disclaimer">本工具僅依歷史股價與均線做型態判斷，供參考使用，'
